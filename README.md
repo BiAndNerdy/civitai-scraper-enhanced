@@ -15,7 +15,7 @@ pip install -r requirements.txt
 
 Run the script with the following command.
 
-```bash
+```
 python3 civitai-scraper.py --help
 
 Usage: civitai-scraper.py [OPTIONS]
