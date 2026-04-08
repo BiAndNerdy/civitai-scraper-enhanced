@@ -26,6 +26,7 @@ Options:
   -d, --debug BOOLEAN         Enable debug logging
   -s, --silent BOOLEAN        Disable logging
   -k, --api-key TEXT          API key for Civitai  [required]
+  -u, --username TEXT         CivitAI username to scrape
   -o, --output-path TEXT      Path to save the images
   -z, --compress              Compress images to reduce file size
   -w, --workers INTEGER       Number of workers to use for downloading
@@ -46,5 +47,30 @@ Options:
   --nsfw-only BOOLEAN         Only download NSFW images
   --segment-by-date           Segment images into directories by date
   --segment-by-rating         Segment images into directories by rating
+  --avif                      Save images in AVIF format
+  --no-prompt-files           Skip saving prompt text files alongside downloads
+  --type [image|video]        Only download this media type
   --help                      Show this message and exit.
 ```
+
+## Options
+
+### `-u, --username`
+
+The CivitAI username whose images you want to download. Optional — omitting it scrapes across all users.
+
+### `--avif`
+
+Save images in AVIF format instead of their original format. AVIF offers significantly better compression than JPEG. Combine with `--compress` to use lossy compression (quality 70); without it, lossless encoding is used.
+
+### `--no-prompt-files`
+
+By default, if an image has generation metadata, its prompt is saved as a `.txt` file alongside the image. Pass this flag to skip that entirely.
+
+### `--type [image|video]`
+
+Filter downloads to only images or only videos. Without this flag, both are downloaded.
+
+## Reliability
+
+Downloads use atomic writes — files are written to a temporary `.tmp` path and renamed into place only once fully complete. This prevents corrupt or partial files from being left on disk if a download fails mid-write. HTTP errors from the API are retried up to 3 times before giving up on a page.

@@ -163,5 +163,8 @@ cython_debug/
 
 *.jpg
 *.log
+*.csv
 
 dl/
+Sigma_Tiger_Investor/
+CLAUDE.md
