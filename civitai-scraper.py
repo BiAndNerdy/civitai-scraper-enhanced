@@ -3,6 +3,7 @@ import os
 import re
 import time
 import logging
+from urllib.parse import quote
 from multiprocessing import Pool
 from io import BytesIO
 
@@ -12,12 +13,72 @@ import requests
 import pillow_avif
 from PIL import Image, UnidentifiedImageError
 
-# Base API endpoint — username, NSFW level, media type, and cursor are appended at runtime
-INITIAL_URL = "https://civitai.com/api/v1/images?sort=Newest"
+VERSION = "2.0.0"
+
+# Base API endpoint — sort, username, NSFW level, media type, and cursor are appended at runtime
+INITIAL_URL = "https://civitai.com/api/v1/images"
 DEFAULT_WORKERS = 1
 
 # Used to strip HTML tags from prompt text before saving to .txt files
 TAG_REGEX = re.compile(r'<.*?>')
+
+
+def load_config_callback(ctx, param, value):
+    """
+    Click callback for --config. Parses a config file into ctx.default_map so
+    that file values act as defaults and can be overridden by CLI flags.
+
+    Config file format:
+        # lines starting with # are comments
+        --flag-name value
+        --boolean-flag          (no value = True)
+    """
+    if not value:
+        return
+
+    try:
+        with open(value, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError as e:
+        raise click.BadParameter(f"Cannot read config file: {e}", param=param)
+
+    config = {}
+    for line in lines:
+        # Strip inline and full-line comments, then whitespace
+        line = line.split("#")[0].strip()
+        if not line:
+            continue
+
+        parts = line.split(None, 1)
+        flag = parts[0] if parts[0].startswith("-") else f"--{parts[0]}"
+
+        # Look up the real parameter name from Click's param list — necessary
+        # when the flag name differs from the parameter name (e.g. --type → media_type)
+        key = None
+        for p in ctx.command.params:
+            if hasattr(p, 'opts') and flag in p.opts:
+                key = p.name
+                break
+        if key is None:
+            key = flag.lstrip("-").replace("-", "_")
+
+        if len(parts) == 1:
+            # Boolean flag with no value — e.g. --nsfw-only
+            val = True
+        else:
+            raw = parts[1].strip()
+            # Coerce "true"/"false" strings to bools for flag options
+            if raw.lower() == "true":
+                val = True
+            elif raw.lower() == "false":
+                val = False
+            else:
+                val = raw
+
+        config[key] = val
+
+    ctx.default_map = ctx.default_map or {}
+    ctx.default_map.update(config)
 
 
 class FilterParams:
@@ -72,6 +133,19 @@ def has_prompt(item):
     return False
 
 
+def load_keywords(value):
+    """
+    If value is a path to an existing file, read its contents and return them
+    as a comma-separated string of keywords (one per line). Otherwise return
+    the value as-is, treating it as a literal comma-separated keyword string.
+    """
+    if value and os.path.isfile(value):
+        with open(value, "r", encoding="utf-8") as f:
+            keywords = [kw.strip() for line in f for kw in line.split(",") if kw.strip()]
+            return ",".join(keywords)
+    return value
+
+
 def contains_keywords(item, require_keywords):
     """
     Return True if the item's prompt contains at least one keyword from the
@@ -81,8 +155,9 @@ def contains_keywords(item, require_keywords):
         return False
 
     if require_keywords != "":
+        prompt_lower = item['meta']['prompt'].lower()
         for keyword in require_keywords.split(","):
-            if str(keyword).strip() in item['meta']['prompt']:
+            if str(keyword).strip().lower() in prompt_lower:
                 return True
 
     return False
@@ -97,8 +172,9 @@ def should_ignore(item, ignore_keywords):
         return False
 
     if ignore_keywords != "":
+        prompt_lower = item['meta']['prompt'].lower()
         for keyword in ignore_keywords.split(","):
-            if str(keyword).strip() in item['meta']['prompt']:
+            if str(keyword).strip().lower() in prompt_lower:
                 return True
 
     return False
@@ -122,13 +198,18 @@ def download_file(url, identifier, filepath, extension, compress=False, avif=Fal
     item_response = requests.get(url)
     item_response.raise_for_status()
 
+    content_type   = item_response.headers.get('Content-Type', 'unknown')
+    content_length = item_response.headers.get('Content-Length', 'unknown')
+    actual_bytes   = len(item_response.content)
+
     # Determine the final output path based on format flags
+    raw_path = os.path.join(filepath, f"{identifier}.{extension}")
     if avif:
         final_path = os.path.join(filepath, f"{identifier}.avif")
     elif compress:
         final_path = os.path.join(filepath, f"{identifier}.jpg")
     else:
-        final_path = os.path.join(filepath, f"{identifier}.{extension}")
+        final_path = raw_path
 
     tmp_path = final_path + ".tmp"
 
@@ -150,23 +231,32 @@ def download_file(url, identifier, filepath, extension, compress=False, avif=Fal
                     # Pillow requires the .jpg extension to infer JPEG format
                     image.save(tmp_path, optimize=True, quality=80)
 
+                # Atomic rename — final file only appears once fully written
+                os.replace(tmp_path, final_path)
+
             except Exception:
-                # Fall back to raw bytes for videos or unrecognised image formats
-                with open(tmp_path, "wb") as file:
-                    file.write(item_response.content)
+                # Not an image (e.g. a video) — save with the original extension
+                raw_tmp = raw_path + ".tmp"
+                try:
+                    with open(raw_tmp, "wb") as file:
+                        file.write(item_response.content)
+                    os.replace(raw_tmp, raw_path)
+                finally:
+                    if os.path.exists(raw_tmp):
+                        os.remove(raw_tmp)
         else:
             with open(tmp_path, "wb") as file:
                 file.write(item_response.content)
 
-        # Atomic rename — final file only appears once fully written
-        os.replace(tmp_path, final_path)
+            # Atomic rename — final file only appears once fully written
+            os.replace(tmp_path, final_path)
 
     finally:
-        # Clean up temp file if the write or rename failed
+        # Clean up temp file if the Pillow write or rename failed
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-    logging.info(f"Downloaded {identifier}.")
+    return content_type, content_length, actual_bytes
 
 
 def download_item(item, output_path, compress, avif, segment_by_date, segment_by_rating, require_keywords, ignore_keywords, save_prompt_files=True):
@@ -224,7 +314,7 @@ def download_item(item, output_path, compress, avif, segment_by_date, segment_by
             }
 
     try:
-        download_file(
+        content_type, content_length, actual_bytes = download_file(
             url,
             identifier,
             filepath,
@@ -233,12 +323,32 @@ def download_item(item, output_path, compress, avif, segment_by_date, segment_by
             avif
         )
 
+        # CivitAI's original=true CDN path sometimes serves a JPEG thumbnail
+        # instead of the actual video. When that happens, retry using the
+        # image-b2 CDN URL which is where the real video lives.
+        b2_fallback = False
+        if item.get('type') == 'video' and content_type.startswith('image/'):
+            uuid_match = re.search(
+                r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+                url
+            )
+            if uuid_match:
+                b2_url = f"https://image-b2.civitai.com/file/civitai-media-cache/{uuid_match.group()}/original"
+                content_type, content_length, actual_bytes = download_file(
+                    b2_url, identifier, filepath, 'mp4', compress, avif
+                )
+                b2_fallback = True
+
     except Exception as e:
         return {
             "error": e,
             "ignored": False,
             "identifier": identifier,
             "url": url,
+            "content_type": None,
+            "content_length": None,
+            "actual_bytes": None,
+            "b2_fallback": False,
         }
 
     if save_prompt_files and has_prompt(item):
@@ -254,10 +364,15 @@ def download_item(item, output_path, compress, avif, segment_by_date, segment_by
         "ignored": False,
         "identifier": identifier,
         "url": url,
+        "content_type": content_type,
+        "content_length": content_length,
+        "actual_bytes": actual_bytes,
+        "b2_fallback": b2_fallback,
     }
 
 
 @click.command()
+@click.option("--config", type=click.Path(exists=True), default=None, is_eager=True, expose_value=False, callback=load_config_callback, help="Path to a config file with CLI flags")
 @click.option("-d", "--debug", default=False, help="Enable debug logging")
 @click.option("-s", "--silent", default=False, help="Disable logging")
 @click.option("-k", "--api-key", help="API key for Civitai", required=True)
@@ -285,6 +400,7 @@ def download_item(item, output_path, compress, avif, segment_by_date, segment_by
 @click.option("--avif", is_flag=True, help="Save images in AVIF")
 @click.option("--no-prompt-files", is_flag=True, help="Skip saving prompt text files alongside downloads")
 @click.option("--type", "media_type", default=None, type=click.Choice(["image", "video"], case_sensitive=False), help="Only download this media type")
+@click.option("--sort", default="Newest", type=click.Choice(["Newest", "Most Reactions", "Most Comments"], case_sensitive=True), help="Sort order for results")
 def scrape(
         debug,
         silent,
@@ -312,7 +428,8 @@ def scrape(
         segment_by_rating,
         avif,
         no_prompt_files,
-        media_type
+        media_type,
+        sort
 ):
     """Download images from Civitai API."""
 
@@ -322,10 +439,16 @@ def scrape(
     if silent:
         logging.getLogger().setLevel(logging.CRITICAL)
 
+    # Resolve keyword args — accepts either a file path (one keyword per line)
+    # or a literal comma-separated string
+    require_keywords = load_keywords(require_keywords)
+    ignore_keywords = load_keywords(ignore_keywords)
+
     headers = {"Authorization": f"Bearer {api_key}"}
 
     # Build the initial API URL from the base + optional filters
-    api_endpoint = INITIAL_URL + (f"&username={username}" if username else "")
+    api_endpoint = INITIAL_URL + f"?sort={quote(sort)}"
+    api_endpoint += f"&username={username}" if username else ""
 
     # CivitAI uses nsfw=false/X/true — "X" means include all ratings
     if nsfw_only:
@@ -432,6 +555,10 @@ def scrape(
                 filter_params=filters
             )
 
+            # Trim to the remaining quota so we never dispatch more than needed
+            if limit != 0:
+                filtered_items = filtered_items[:limit - total_saved]
+
             # Dispatch this page's items across the worker pool in parallel
             with Pool(workers) as pool:
                 results = pool.starmap(
@@ -456,8 +583,14 @@ def scrape(
                         if result['ignored']:
                             logging.info(f"Ignored {result['identifier']}.")
 
-                        if result['error'] is None:
-                            logging.info(f"Downloaded {result['identifier']}.")
+                        elif result['error'] is None:
+                            label = "b2 fallback" if result.get('b2_fallback') else "ok"
+                            logging.info(
+                                f"Downloaded {result['identifier']} "
+                                f"[{label}, {result['content_type']}, "
+                                f"declared={result['content_length']}b, "
+                                f"actual={result['actual_bytes']}b]"
+                            )
 
                             total_saved += 1
 
