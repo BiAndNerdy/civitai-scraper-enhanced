@@ -1,5 +1,5 @@
 
-# civitai-scraper
+# civitai-scraper-enhanced
 
 Downloads bulk images/videos from CivitAI with filtering, segmentation, and config file support. Fork of [zealsprince/civitai-scraper](https://github.com/zealsprince/civitai-scraper).
 
