@@ -371,7 +371,52 @@ def download_item(item, output_path, compress, avif, segment_by_date, segment_by
     }
 
 
-@click.command()
+EXAMPLES = """\
+  Examples:
+
+    Download all images for a user:
+      python civitai-scraper.py -k $API_KEY -u someuser -o ./output
+
+    Download only videos, sorted by most reactions, with 8 workers:
+      python civitai-scraper.py -k $API_KEY --type video --sort "Most Reactions" -w 8 -o ./output
+
+    Filter by minimum dimensions and engagement:
+      python civitai-scraper.py -k $API_KEY --min-width 512 --min-height 512 --min-like 10 -o ./output
+
+    Download NSFW content only, segmented by date and rating:
+      python civitai-scraper.py -k $API_KEY --nsfw-only --segment-by-date --segment-by-rating -o ./output
+
+    Require a keyword in the prompt, skip prompt .txt files, compress to JPEG:
+      python civitai-scraper.py -k $API_KEY --require-keywords "masterpiece" --no-prompt-files --compress -o ./output
+
+    Resume a previous run from a specific cursor:
+      python civitai-scraper.py -k $API_KEY -c <cursor> -o ./output
+
+    Use a config file instead of flags:
+      python civitai-scraper.py --config my_config.txt
+
+    Config file format (one flag per line, # for comments):
+      --username someuser
+      --output-path ./output
+      --workers 8
+      --nsfw
+      --min-width 512
+
+  Environment variables — every flag can also be set via CIVITAI_SCRAPER_* env vars:
+      CIVITAI_SCRAPER_API_KEY=abc123
+      CIVITAI_SCRAPER_OUTPUT_PATH=./output
+      CIVITAI_SCRAPER_WORKERS=8
+"""
+
+
+class VerbatimEpilogCommand(click.Command):
+    """click.Command subclass that prints the epilog without reflowing it."""
+    def format_epilog(self, ctx, formatter):
+        if self.epilog:
+            formatter.write("\n" + self.epilog + "\n")
+
+
+@click.command(cls=VerbatimEpilogCommand, epilog=EXAMPLES)
 @click.option("--config", type=click.Path(exists=True), default=None, is_eager=True, expose_value=False, callback=load_config_callback, help="Path to a config file with CLI flags")
 @click.option("-d", "--debug", default=False, help="Enable debug logging")
 @click.option("-s", "--silent", default=False, help="Disable logging")
@@ -431,7 +476,12 @@ def scrape(
         media_type,
         sort
 ):
-    """Download images from Civitai API."""
+    """Bulk-download images and videos from CivitAI's public API.
+
+    Paginates through CivitAI's /api/v1/images endpoint and downloads
+    matching files in parallel. Already-downloaded items are tracked in
+    downloaded.log inside the output directory and skipped on future runs.
+    """
 
     if debug:
         logging.getLogger().setLevel(logging.DEBUG)
